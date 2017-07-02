@@ -9,14 +9,16 @@
 static R_altrep_class_t chunkrep_integer_class;
 
 typedef struct CHUNKREP_CHUNK {
+	size_t id;
 	char* data_map;
 	size_t data_map_len;
 	SEXP wrapped;
+	size_t wrapped_offset;
+	size_t wrapped_max;
 } CHUNKREP_CHUNK;
 
-#define MBLEN 1000
-static CHUNKREP_CHUNK chunks[MBLEN]; // FIXME: evil global
-static size_t mappedbat_end = 0;
+static CHUNKREP_CHUNK *chunks;
+static size_t chunks_len = 0;
 
 
 static void
@@ -25,20 +27,25 @@ chunkrep_signalhandler(int sig, siginfo_t *si, void *unused) {
 	(void) unused;
 	char* addr = (char*) si->si_addr;
 
-	for (size_t i = 0; i < mappedbat_end && i < MBLEN; i++) {
+	for (size_t i = 0; i < chunks_len; i++) {
 		CHUNKREP_CHUNK masq = chunks[i];
 		if (addr >= masq.data_map && addr < masq.data_map + masq.data_map_len) {
-		   fprintf(stderr, "Got signal for our address: 0x%lx\n",
-					(long) si->si_addr);
-		 //  mprotect(masq.data_map, masq.data_map_len, PROT_WRITE);
-//		   memcpy(masq.data_map, b->theap.base, masq.data_map_len);
-//		   BBPunfix(masq.bat_cache_id);
+		   fprintf(stderr, "Signal for wrapped address: 0x%lx, belongs to chunk %llu, converting [%llu:%llu]\n",
+					(long) si->si_addr, masq.id, masq.wrapped_offset, masq.wrapped_max);
+		   // convert chunk
+		   // TODO: check mprotect return values (2x)
+		   mprotect(masq.data_map, masq.data_map_len, PROT_WRITE);
+		   for (size_t i = 0; i < masq.wrapped_max - masq.wrapped_offset; i++) {
+			   ((int*) masq.data_map)[i] =  ALTINTEGER_ELT(masq.wrapped, masq.wrapped_offset + i);
+		   }
+		   mprotect(masq.data_map, masq.data_map_len, PROT_READ);
+		   return;
 		}
 	}
 	// TODO: longjump out of there if this was a mistake
-	   fprintf(stderr, "Eeek @ 0x%lx\n",
-				(long) si->si_addr);
-	   exit(EXIT_FAILURE);
+   Rprintf("Eeek @ 0x%lx\n",
+			(long) si->si_addr);
+   exit(EXIT_FAILURE);
 }
 
 static SEXP chunkrep_wrap(SEXP x) {
@@ -70,21 +77,65 @@ static R_xlen_t chunkrep_length(SEXP x) {
 
 
 static void* chunkrep_dataptr(SEXP x, Rboolean writeable) {
+
 	if (R_altrep_data2(x) == R_NilValue) {
-		CHUNKREP_CHUNK* masq = malloc(sizeof(CHUNKREP_CHUNK));
+		size_t sexp_len = LENGTH(R_altrep_data1(x));
+		// TODO: make chunk_len a parameter?
+		size_t chunk_len = sysconf(_SC_PAGESIZE) * 20000; // ca 80 MB
+		size_t nchunks = (size_t) ceil((double)(sexp_len * sizeof(int))/chunk_len);
+		size_t wrapper_len = chunk_len * nchunks;
 
-		// TODO: mmap in batches so we can free them individually
-		masq->data_map_len = LENGTH(R_altrep_data1(x)) * sizeof(int); // space for R vector
-		masq->data_map = mmap(NULL, masq->data_map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		masq->wrapped = R_altrep_data1(x);
 
-		//memcpy(&(mappedbats[mappedbat_end]), masq, sizeof(R_MASQ_BAT));
-		//mappedbat_end++;
+		void* wrapper = mmap(NULL, wrapper_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (wrapper == NULL) {
+			error("mmap failure 1");
+			return NULL;
+		}
+		// TODO: have a global struct of protected areas, remove particular area when converted
+		if (chunks) {
+			free(chunks);
+		}
 
-		mprotect(masq->data_map, masq->data_map_len, PROT_NONE);
-		R_set_altrep_data2(x, R_MakeExternalPtr(masq->data_map, R_NilValue, R_NilValue));
+		Rprintf("dataptr(), setting up %llu maps in [%p, %p]\n", nchunks, wrapper, (char*) wrapper + wrapper_len - 1);
+
+
+		chunks = malloc(sizeof(CHUNKREP_CHUNK) * nchunks);
+		if (!chunks) {
+			chunks_len = 0;
+			error("malloc failure");
+			return NULL;
+		}
+		chunks_len = nchunks;
+
+		for (size_t id = 0; id < nchunks; id++) {
+			size_t val_offset = id * chunk_len;
+			size_t wrapped_offset = val_offset/sizeof(int);
+			size_t max_offset = wrapped_offset + (chunk_len/sizeof(int));
+			char* base_addr = ((char*) wrapper) + val_offset;
+			if (max_offset > sexp_len) {
+				max_offset = sexp_len;
+			}
+
+			// TODO: do not use chunk_len for last map, wastes space, page-align instead
+			chunks[id].id = id;
+			chunks[id].wrapped        = R_altrep_data1(x);
+			chunks[id].wrapped_offset = wrapped_offset;
+			chunks[id].wrapped_max    = max_offset;
+			chunks[id].data_map_len   = chunk_len;
+
+			chunks[id].data_map = mmap(base_addr, chunk_len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if(chunks[id].data_map == NULL || chunks[id].data_map != base_addr) {
+				error("mmap failure 2");
+				return NULL;
+			}
+			// TODO: check mprotect return code
+			mprotect(chunks[id].data_map, chunk_len, PROT_NONE);
+		}
+		// just abuse as flag for setup
+		R_set_altrep_data2(x, R_NaString);
 	}
-	return R_ExternalPtrAddr(R_altrep_data2(x));
+	// TODO: protect this
+	return chunks[0].data_map;
 }
 
 
@@ -131,7 +182,7 @@ void R_init_chunkrep(DllInfo *dll) {
     sa.sa_sigaction = chunkrep_signalhandler;
 
     // TODO: which signal on Linux?
-    // TODO: what about R's handler?
+    // TODO: what about R's segfault handler?
     sigaction(SIGBUS, &sa, NULL);
 
 	/* override ALTREP methods */
