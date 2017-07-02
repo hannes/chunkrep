@@ -6,4 +6,4 @@ length(b)
 head(b)
 tail(b)
 
-dd <- complete.cases(b)
+str(complete.cases(b))
