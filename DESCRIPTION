@@ -1,0 +1,9 @@
+Package: chunkrep
+Version: 0.0.1
+Title: Lazy, chunked conversion for ALTREP vectors
+Author: Hannes Muehleisen [aut, cre]
+Maintainer: Hannes Muehleisen <hannes@cwi.nl>
+Description: Many things
+License: MPL (== 2.0)
+URL: https://github.com/hannesmuehleisen/chunkrep
+Collate: chunkrep.R
