@@ -83,7 +83,6 @@ wrapup:
 		default_signal_action.sa_sigaction(sig, si, unused);
 		return;
 	}
-   exit(EXIT_FAILURE);
 }
 
 static SEXP chunkrep_wrap(SEXP x) {
@@ -247,9 +246,18 @@ static int chunkrep_no_na(SEXP x) {
 }
 
 
+static SEXP chunkrep_treesize(void) {
+	if (!chunkrep_chunktree) {
+		error("chunkrep tree missing");
+		return R_NilValue;
+	}
+	return ScalarInteger(kb_size(chunkrep_chunktree));
+}
+
 #define CALLDEF(name, n)  {#name, (DL_FUNC) &name, n}
 static const R_CallMethodDef R_CallDef[] = {
    CALLDEF(chunkrep_wrap, 1),
+   CALLDEF(chunkrep_treesize, 0),
    {NULL, NULL, 0}
 };
 

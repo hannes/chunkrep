@@ -1,0 +1,7 @@
+^\.git
+.*\.o
+.*\.so
+.*\.DS_Store
+^\.cproject
+^\.project
+^\.settings

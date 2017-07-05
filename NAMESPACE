@@ -1,3 +1,4 @@
 export(wrap)
+export(treesize)
 
 useDynLib(chunkrep, .registration = TRUE)
