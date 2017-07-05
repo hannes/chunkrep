@@ -127,7 +127,6 @@ static void chunkrep_finalizer(SEXP x) {
 	if (munmap(masq->data_map, masq->data_map_len) != 0) {
 		error("munmap error?!");
 	}
-//	Rprintf("uuuh %p %p\n", masq, masq->next);
 
 	while(masq != NULL) {
 		CHUNKREP_CHUNK *next = masq->next;
