@@ -2,7 +2,7 @@ options(chunkrep.len=100L)
 #options(chunkrep.debug=T)
 stopifnot(identical(chunkrep::treesize(), 0L))
 
-for (i in 1:1){
+for (i in 1:3){
 	print(i)
 	a <- 1:10^7
 	a1 <- 10^7:1

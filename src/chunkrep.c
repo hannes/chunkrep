@@ -116,6 +116,7 @@ static R_xlen_t chunkrep_length(SEXP x) {
 static void chunkrep_finalizer(SEXP x) {
 	CHUNKREP_CHUNK probe;
 	CHUNKREP_CHUNK *masq = NULL;
+
 	probe.chunk_map = R_ExternalPtrAddr(x);
 	probe.chunk_map_len = 1;
 
@@ -126,6 +127,8 @@ static void chunkrep_finalizer(SEXP x) {
 	if (munmap(masq->data_map, masq->data_map_len) != 0) {
 		error("munmap error?!");
 	}
+
+	// TODO: inorder traversal for chunk removal? in-place modification, so maybe not supported by kbtree
 
 	while(masq != NULL) {
 		CHUNKREP_CHUNK *next = masq->next;
