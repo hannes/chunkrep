@@ -11,28 +11,35 @@
 static R_altrep_class_t chunkrep_integer_class;
 
 typedef struct CHUNKREP_CHUNK {
-	size_t id;
 	char* data_map;
 	size_t data_map_len;
+
+	char* chunk_map;
+	size_t chunk_map_len;
+
 	SEXP wrapped;
 	size_t wrapped_offset;
 	size_t wrapped_max;
+
+	size_t id;
+	char converted;
+	struct CHUNKREP_CHUNK *next;
 } CHUNKREP_CHUNK;
 
-int ct_elem_cmp_fun(const CHUNKREP_CHUNK *a, const CHUNKREP_CHUNK *b) {
-	if (a->data_map < b->data_map && a->data_map + a->data_map_len <= b->data_map) {
+int ct_chunk_cmp_fun(const CHUNKREP_CHUNK *a, const CHUNKREP_CHUNK *b) {
+	if (a->chunk_map < b->chunk_map && a->chunk_map + a->chunk_map_len <= b->chunk_map) {
 		return -1;
 	}
-	if (b->data_map < a->data_map && b->data_map + b->data_map_len <= a->data_map) {
+	if (b->chunk_map < a->chunk_map && b->chunk_map + b->chunk_map_len <= a->chunk_map) {
 		return 1;
 	}
 	return 0;
 }
 
-#define ct_elem_cmp(a, b) (ct_elem_cmp_fun(&(a), &(b)))
-
-KBTREE_INIT(chunktree, CHUNKREP_CHUNK, ct_elem_cmp)
+#define ct_chunk_cmp(a, b) (ct_chunk_cmp_fun(&(a), &(b)))
+KBTREE_INIT(chunktree, CHUNKREP_CHUNK, ct_chunk_cmp)
 kbtree_t(chunktree) *chunkrep_chunktree;
+
 
 static struct sigaction default_signal_action;
 
@@ -44,27 +51,27 @@ chunkrep_signalhandler(int sig, siginfo_t *si, void *unused) {
 	(void) unused;
 	char* addr = (char*) si->si_addr;
 	CHUNKREP_CHUNK *masq = NULL;
-	chunkrep_probe.data_map = addr;
-	chunkrep_probe.data_map_len = 1;
+	chunkrep_probe.chunk_map = addr;
+	chunkrep_probe.chunk_map_len = 1;
 
 	masq = kb_getp(chunktree, chunkrep_chunktree, &chunkrep_probe);
-	if (masq) {
+	if (masq && !masq->converted) {
 		if (Rf_GetOption1(install("chunkrep.debug")) != R_NilValue) {
 			Rprintf( "💣  %p → chunk %llu [%llu:%llu]\n",
 				(void*) si->si_addr, masq->id, masq->wrapped_offset, masq->wrapped_max);
 		}
 	   // convert chunk
-	   if (mprotect(masq->data_map, masq->data_map_len, PROT_WRITE) != 0) {
+	   if (mprotect(masq->chunk_map, masq->chunk_map_len, PROT_WRITE) != 0) {
 		   goto wrapup;
 	   }
 	   for (size_t i = 0; i < masq->wrapped_max - masq->wrapped_offset; i++) {
 		   // TODO: use region_integer here if available
-		   ((int*) masq->data_map)[i] = ALTINTEGER_ELT(masq->wrapped, masq->wrapped_offset + i);
+		   ((int*) masq->chunk_map)[i] = ALTINTEGER_ELT(masq->wrapped, masq->wrapped_offset + i);
 	   }
-	   if (mprotect(masq->data_map, masq->data_map_len, PROT_READ) != 0) {
+	   if (mprotect(masq->chunk_map, masq->chunk_map_len, PROT_READ) != 0) {
 		   goto wrapup;
 	   }
-	   kb_delp_chunktree(chunkrep_chunktree, masq);
+	   masq->converted = 1;
 	   return;
 	}
 
@@ -108,20 +115,53 @@ static R_xlen_t chunkrep_length(SEXP x) {
 }
 
 
+static void chunkrep_finalizer(SEXP x) {
+	CHUNKREP_CHUNK probe;
+	CHUNKREP_CHUNK *masq = NULL;
+	probe.chunk_map = R_ExternalPtrAddr(x);
+	probe.chunk_map_len = 1;
+
+	masq = kb_getp(chunktree, chunkrep_chunktree, &probe);
+	if (!masq) {
+		return;
+	}
+	if (munmap(masq->data_map, masq->data_map_len) != 0) {
+		error("munmap error?!");
+	}
+	for(; masq != NULL; masq = masq->next) {
+		kb_delp_chunktree(chunkrep_chunktree, masq);
+	}
+	if (Rf_GetOption1(install("chunkrep.debug")) != R_NilValue) {
+		Rprintf("finalizer success on %p\n", R_ExternalPtrAddr(x));
+	}
+}
+
+
 static void* chunkrep_dataptr(SEXP x, Rboolean writeable) {
 	if (R_altrep_data2(x) == R_NilValue) {
 		void* dataptr = NULL;
+
+	    struct sigaction sa_r;
 
 		size_t sexp_len = LENGTH(R_altrep_data1(x));
 		size_t chunk_len = sysconf(_SC_PAGESIZE) * INTEGER(Rf_GetOption1(install("chunkrep.len")))[0];
 		size_t nchunks = (size_t) ceil((double)(sexp_len * sizeof(int))/chunk_len);
 		size_t wrapper_len = chunk_len * nchunks;
+		SEXP res;
+		CHUNKREP_CHUNK *prev = NULL;
 
 		void* wrapper = mmap(NULL, wrapper_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		if (wrapper == NULL) {
 			error("mmap failure 1");
 			return NULL;
 		}
+		// check if our signal hander is still installed
+		sigaction(SIGBUS, NULL, &sa_r);
+		if (sa_r.sa_sigaction != chunkrep_signalhandler) {
+			error("someone overwrote the signal handler");
+			return NULL;
+		}
+
 		if (Rf_GetOption1(install("chunkrep.debug")) != R_NilValue) {
 			Rprintf("DATAPTR(), setting up %llu maps in [%p, %p]\n", nchunks, wrapper, (char*) wrapper + wrapper_len - 1);
 		}
@@ -142,27 +182,42 @@ static void* chunkrep_dataptr(SEXP x, Rboolean writeable) {
 
 			// TODO: do not use chunk_len for last map, wastes space, page-align instead
 			chunk->id = id;
+			chunk->converted = 0;
+
+			// slightly evil: keep linked list for all chunks in a sexp within the tree
+			chunk->next = NULL;
+			if (prev) {
+				prev->next = chunk;
+			}
+			prev = chunk;
+
+			chunk->data_map = wrapper;
+			chunk->data_map_len = wrapper_len;
+
 			chunk->wrapped        = R_altrep_data1(x);
 			chunk->wrapped_offset = wrapped_offset;
 			chunk->wrapped_max    = max_offset;
-			chunk->data_map_len   = chunk_len;
 
-			chunk->data_map = mmap(base_addr, chunk_len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			if(chunk->data_map == NULL || chunk->data_map != base_addr) {
+			chunk->chunk_map_len   = chunk_len;
+			chunk->chunk_map = mmap(base_addr, chunk_len, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if(chunk->chunk_map == NULL || chunk->chunk_map != base_addr) {
 				error("mmap failure 2");
 				return NULL;
 			}
-			// TODO: check mprotect return code
-			if (mprotect(chunk->data_map, chunk_len, PROT_NONE) != 0) {
+			if (mprotect(chunk->chunk_map, chunk_len, PROT_NONE) != 0) {
 				error("mprotect failure");
 				return NULL;
 			}
 			kb_putp_chunktree(chunkrep_chunktree, chunk);
+
 			if (!dataptr) {
-				dataptr = chunk->data_map;
+				dataptr = chunk->chunk_map;
 			}
 		}
-		R_set_altrep_data2(x, R_MakeExternalPtr(dataptr, R_NilValue, R_NilValue));
+		res = PROTECT(R_MakeExternalPtr(dataptr, R_NilValue, R_NilValue));
+		R_RegisterCFinalizer(res, chunkrep_finalizer);
+		R_set_altrep_data2(x, res);
+		UNPROTECT(1);
 	}
 	return R_ExternalPtrAddr(R_altrep_data2(x));
 }
@@ -178,7 +233,7 @@ static int chunkrep_elt_integer(SEXP x, R_xlen_t i) {
 }
 
 
-// FIXME
+// FIXME although nobody seems to be calling this yet
 static R_xlen_t chunkrep_region_integer(SEXP sx, R_xlen_t i, R_xlen_t n, int *buf) {
 	error("region_integer() called but not supported");
     return 0;
@@ -188,7 +243,6 @@ static R_xlen_t chunkrep_region_integer(SEXP sx, R_xlen_t i, R_xlen_t n, int *bu
 static int chunkrep_is_sorted(SEXP x) {
 	return INTEGER_IS_SORTED(R_altrep_data1(x));
 }
-
 
 static int chunkrep_no_na(SEXP x) {
 	return INTEGER_NO_NA(R_altrep_data1(x));
@@ -229,8 +283,6 @@ void R_init_chunkrep(DllInfo *dll) {
     chunkrep_integer_class = cls;
 
     chunkrep_chunktree = kb_init(chunktree, KB_DEFAULT_SIZE);
-
-    // TODO: how to clean up unused entries for tree that is free'd
 
 	R_registerRoutines(dll, NULL, R_CallDef, NULL, NULL);
 	R_useDynamicSymbols(dll, FALSE);

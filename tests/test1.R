@@ -1,5 +1,7 @@
 #options(chunkrep.len=1000L)#, 
 options(chunkrep.debug=T)
+
+
 a <- 1:10^7
 a1 <- 10^7:1
 
@@ -22,3 +24,8 @@ str(complete.cases(b1))
 
 identical(a, b)
 identical(a1, b1)
+
+b <- NULL
+b1 <- NULL
+
+gc()
